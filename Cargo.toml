@@ -2,6 +2,7 @@
 name = "loudcontrol"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 description = "Per-application audio ducking for Windows: sound from some apps lowers the volume of others."
 
 [dependencies]

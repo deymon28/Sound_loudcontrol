@@ -22,7 +22,7 @@ Rules decide which apps trigger ducking, which apps get lowered, and how:
 ## Requirements
 
 - Windows 10 or 11.
-- To build: a Rust toolchain (stable, edition 2024) with the MSVC target.
+- To build: a Rust toolchain 1.88 or newer (edition 2024) with the MSVC target.
 
 ## Build and run
 
@@ -39,6 +39,7 @@ Command-line options:
 | --- | --- |
 | `--minimized` | Start in the tray (this is what "Start with Windows" uses). |
 | `--list` | Print every audio session with its executable name, volume, peak level and device, then exit. Use it to find the exact name to put in a rule. |
+| `--version` | Print the version, then exit. |
 
 ## How it works
 
@@ -58,8 +59,14 @@ Volume is always handed back:
 
 - on normal exit and when Windows signs out or shuts down, every ducked app is restored
   immediately;
+- if a ducked app is closed, Windows remembers its lowered volume for the app's next start.
+  LoudControl keeps the normal volume and sets it back as soon as the app plays again;
 - if the process is killed while something is ducked, the original volumes stay in
   `restore.toml`, and the next launch restores them (even after the app itself was restarted).
+  Entries older than three days are dropped.
+
+If the engine hits an internal error, it restores every volume, logs the error and starts
+again. After repeated failures it stops and shows an error in the window.
 
 Session peak meters measure the signal before the session volume. Ducking a target therefore
 never changes its own meter reading, and a trigger's mixer slider does not affect detection.
@@ -67,8 +74,14 @@ never changes its own meter reading, and a trigger's mixer slider does not affec
 ## Configuration
 
 Settings are stored in `%APPDATA%\LoudControl\config.toml`. Changes made in the UI are saved
-automatically. The file can also be edited by hand and reloaded from **Settings → Files**.
-Set the `LOUDCONTROL_HOME` environment variable to use a different directory.
+automatically. The file can also be edited by hand and reloaded from **Settings → Files**
+(this also applies the pause hotkey). Set the `LOUDCONTROL_HOME` environment variable to use a
+different directory. Each directory is its own instance, so a test copy with its own
+`LOUDCONTROL_HOME` can run next to the normal one.
+
+If `config.toml` cannot be parsed, LoudControl starts with defaults and keeps the broken file as
+`config.broken.toml`. If even that copy fails, it does not overwrite the file at all until a
+reload succeeds.
 
 ```toml
 [settings]
@@ -94,8 +107,9 @@ hold_ms = 900.0
 release_ms = 1200.0
 ```
 
-Logs go to `%APPDATA%\LoudControl\loudcontrol.log`, which rotates at 1 MB. Set
-`LOUDCONTROL_LOG=debug` for per-session detail.
+Logs go to `%APPDATA%\LoudControl\loudcontrol.log` with UTC timestamps. The file rotates to
+`loudcontrol.log.old` at 1 MB. Set `LOUDCONTROL_LOG=debug` for per-session detail (`warn` and
+`trace` also work).
 
 ## Limitations
 
@@ -109,7 +123,7 @@ Logs go to `%APPDATA%\LoudControl\loudcontrol.log`, which rotates at 1 MB. Set
 ## Development
 
 ```powershell
-cargo test            # rule logic, config parsing
+cargo test            # rule logic, app matching, volume bookkeeping, config parsing
 cargo clippy --release
 ```
 

@@ -24,6 +24,13 @@ const USER_CHANGE_EPSILON: f32 = 0.004;
 const METER_FALL_DB_PER_S: f32 = 40.0;
 /// Pending restores older than this are dropped.
 const RESTORE_MAX_AGE_S: u64 = 3 * 24 * 3600;
+/// Below this duck gain a user's slider move is taken as the new volume itself: dividing by a
+/// near-zero gain would turn a small nudge of a muted app into full volume after the duck.
+const MIN_REBASE_GAIN: f32 = 0.05;
+/// After this many failures in a row the engine stops restarting itself.
+const MAX_ENGINE_RESTARTS: u32 = 5;
+/// An engine run at least this long before failing resets the failure count.
+const HEALTHY_RUN: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Default)]
 pub struct SessionView {
@@ -166,6 +173,36 @@ struct Managed {
     base: f32,
     last_written: f32,
     gain: f32,
+    /// Kept so the volume can still be handed back if the session disappears while ducked.
+    session_id: String,
+    label: String,
+}
+
+impl Managed {
+    fn new(current: f32, session_id: String, label: String) -> Self {
+        Self { base: current, last_written: current, gain: 1.0, session_id, label }
+    }
+
+    /// Detects a slider move by the user (a reading that differs from our last write) and folds
+    /// it into the base volume. Returns true when the base changed.
+    fn absorb_user_change(&mut self, current: f32) -> bool {
+        if (current - self.last_written).abs() <= USER_CHANGE_EPSILON {
+            return false;
+        }
+        self.base = if self.gain >= MIN_REBASE_GAIN { (current / self.gain).min(1.0) } else { current };
+        self.last_written = current;
+        true
+    }
+
+    fn restore_entry(&self, instance_id: &str, now: u64) -> RestoreEntry {
+        RestoreEntry {
+            instance_id: instance_id.to_owned(),
+            session_id: self.session_id.clone(),
+            exe: self.label.clone(),
+            volume: self.base,
+            saved_unix: now,
+        }
+    }
 }
 
 /// Crash-safety record of volumes that must be returned to the user.
@@ -230,53 +267,101 @@ fn run_engine(shared: Arc<Shared>) {
         shared.telemetry.lock().unwrap().error = Some(format!("COM initialization failed: {e}"));
         return;
     }
-    // The audio service can be briefly unavailable (e.g. right after logon); keep retrying.
-    let audio = loop {
-        match AudioSystem::new() {
-            Ok(a) => break a,
-            Err(e) => {
-                log::warn!("audio system unavailable, retrying: {e}");
-                shared.telemetry.lock().unwrap().error = Some(format!("Audio system unavailable: {e}"));
-                for _ in 0..20 {
-                    if shared.shutdown.load(Ordering::Acquire) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
+    // A panic inside the loop must neither leave apps ducked nor leave the program running
+    // without an engine: volumes are restored and the engine starts again from a clean state.
+    let mut failures = 0;
+    loop {
+        let Some(mut engine) = Engine::start(shared.clone()) else { return };
+        let started = Instant::now();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.main_loop()));
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.restore_all())).is_err() {
+            log::error!("restoring volumes failed; restore.toml keeps them for the next start");
         }
-    };
-    shared.telemetry.lock().unwrap().error = None;
-
-    let pending_restore = load_restore_file();
-    if !pending_restore.is_empty() {
-        log::warn!("{} volume(s) left ducked by a previous run will be restored", pending_restore.len());
+        if outcome.is_ok() {
+            log::info!("engine stopped, all volumes restored");
+            return;
+        }
+        drop(engine);
+        if started.elapsed() >= HEALTHY_RUN {
+            failures = 0;
+        }
+        failures += 1;
+        if failures > MAX_ENGINE_RESTARTS {
+            log::error!("engine failed {failures} times in a row; giving up");
+            set_error(&shared, Some("Ducking engine failed repeatedly; see the log and restart LoudControl".into()));
+            return;
+        }
+        log::error!("engine failed; restarting ({failures}/{MAX_ENGINE_RESTARTS})");
+        if !sleep_unless_shutdown(&shared, Duration::from_secs(1)) {
+            return;
+        }
     }
-    let cfg = shared.config_snapshot();
-    let compiled = cfg.rules.iter().map(CompiledRule::new).collect();
-    let mut engine = Engine {
-        compiled,
-        cfg_rev: shared.config_rev.load(Ordering::Acquire),
-        cfg,
-        shared,
-        audio,
-        rule_states: HashMap::new(),
-        managed: HashMap::new(),
-        pending_restore,
-        restore_dirty: true,
-        meters: HashMap::new(),
-        rule_meters: HashMap::new(),
-        last_telemetry: Instant::now() - Duration::from_secs(1),
-        was_ducking: false,
-        was_paused: false,
-    };
-    log::info!("engine started");
-    engine.main_loop();
-    engine.restore_all();
-    log::info!("engine stopped, all volumes restored");
+}
+
+/// Sets the error shown in the UI; tolerates a mutex poisoned by an earlier panic.
+fn set_error(shared: &Shared, error: Option<String>) {
+    shared.telemetry.lock().unwrap_or_else(|e| e.into_inner()).error = error;
+}
+
+/// Sleeps in short steps; returns false as soon as shutdown is requested.
+fn sleep_unless_shutdown(shared: &Shared, total: Duration) -> bool {
+    let step = Duration::from_millis(50);
+    let mut left = total;
+    while !left.is_zero() {
+        if shared.shutdown.load(Ordering::Acquire) {
+            return false;
+        }
+        let d = left.min(step);
+        std::thread::sleep(d);
+        left -= d;
+    }
+    !shared.shutdown.load(Ordering::Acquire)
 }
 
 impl Engine {
+    /// Opens the audio system (retrying while it is unavailable) and loads pending restores.
+    /// Returns `None` if shutdown was requested meanwhile.
+    fn start(shared: Arc<Shared>) -> Option<Self> {
+        // The audio service can be briefly unavailable (e.g. right after logon); keep retrying.
+        let audio = loop {
+            match AudioSystem::new() {
+                Ok(a) => break a,
+                Err(e) => {
+                    log::warn!("audio system unavailable, retrying: {e}");
+                    set_error(&shared, Some(format!("Audio system unavailable: {e}")));
+                    if !sleep_unless_shutdown(&shared, Duration::from_secs(2)) {
+                        return None;
+                    }
+                }
+            }
+        };
+        set_error(&shared, None);
+
+        let pending_restore = load_restore_file();
+        if !pending_restore.is_empty() {
+            log::warn!("{} volume(s) left ducked earlier will be restored", pending_restore.len());
+        }
+        let cfg = shared.config_snapshot();
+        let compiled = cfg.rules.iter().map(CompiledRule::new).collect();
+        log::info!("engine started");
+        Some(Engine {
+            compiled,
+            cfg_rev: shared.config_rev.load(Ordering::Acquire),
+            cfg,
+            shared,
+            audio,
+            rule_states: HashMap::new(),
+            managed: HashMap::new(),
+            pending_restore,
+            restore_dirty: true,
+            meters: HashMap::new(),
+            rule_meters: HashMap::new(),
+            last_telemetry: Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now),
+            was_ducking: false,
+            was_paused: false,
+        })
+    }
+
     fn main_loop(&mut self) {
         let mut ticker = Ticker::new();
         let mut last = Instant::now();
@@ -295,16 +380,26 @@ impl Engine {
                 self.compiled = self.cfg.rules.iter().map(CompiledRule::new).collect();
                 let live: Vec<u64> = self.cfg.rules.iter().map(|r| r.uid).collect();
                 self.rule_states.retain(|uid, _| live.contains(uid));
+                self.rule_meters.retain(|uid, _| live.contains(uid));
             }
 
             let refreshed = self.audio.refresh(false);
             for id in &refreshed.removed {
-                self.managed.remove(id);
                 self.meters.remove(id);
-                self.restore_dirty = true;
+                if let Some(m) = self.managed.remove(id) {
+                    // The app closed (or lost its device) while ducked. Windows remembers the
+                    // lowered volume for the app's next start, so the user's volume is handed
+                    // back when its session returns.
+                    log::info!("{} went away while ducked; {:.0}% will be restored when it returns", m.label, m.base * 100.0);
+                    self.pending_restore.push(m.restore_entry(id, unix_now()));
+                    self.restore_dirty = true;
+                }
             }
             if !refreshed.added.is_empty() {
                 self.apply_pending_restore();
+            }
+            if !refreshed.removed.is_empty() {
+                self.prune_pending_restore();
             }
 
             let busy = self.tick(dt_ms.clamp(0.0, 250.0));
@@ -457,15 +552,37 @@ impl Engine {
     }
 
     fn restore_all(&mut self) {
-        for (key, m) in self.managed.drain() {
-            if let Some(s) = self.audio.sessions.get(&key) {
-                match s.set_volume(m.base) {
-                    Ok(()) => log::info!("restored {} to {:.0}%", s.label(), m.base * 100.0),
-                    Err(e) => log::warn!("cannot restore {}: {e}", s.label()),
-                }
+        let now = unix_now();
+        for (key, m) in std::mem::take(&mut self.managed) {
+            let restored = match self.audio.sessions.get(&key) {
+                Some(s) => match s.set_volume(m.base) {
+                    Ok(()) => {
+                        log::info!("restored {} to {:.0}%", m.label, m.base * 100.0);
+                        true
+                    }
+                    Err(e) => {
+                        log::warn!("cannot restore {}: {e}", m.label);
+                        false
+                    }
+                },
+                None => false,
+            };
+            if !restored {
+                // Kept in restore.toml, so the next start (or the app's return) fixes it.
+                self.pending_restore.push(m.restore_entry(&key, now));
             }
         }
         self.save_restore_file();
+    }
+
+    /// Forgets pending restores that are too old to be trusted.
+    fn prune_pending_restore(&mut self) {
+        let now = unix_now();
+        let before = self.pending_restore.len();
+        self.pending_restore.retain(|e| now.saturating_sub(e.saved_unix) < RESTORE_MAX_AGE_S);
+        if self.pending_restore.len() != before {
+            self.restore_dirty = true;
+        }
     }
 
     fn apply_pending_restore(&mut self) {
@@ -474,14 +591,21 @@ impl Engine {
         }
         let before = self.pending_restore.len();
         let sessions = &self.audio.sessions;
+        let managed = &self.managed;
         self.pending_restore.retain(|e| {
-            let hit = sessions
-                .get(&e.instance_id)
-                .or_else(|| sessions.values().find(|s| !e.session_id.is_empty() && s.session_id == e.session_id));
+            let hit = sessions.get_key_value(&e.instance_id).or_else(|| {
+                sessions.iter().find(|(_, s)| !e.session_id.is_empty() && s.session_id == e.session_id)
+            });
             match hit {
-                Some(s) => {
+                Some((key, _)) if managed.contains_key(key) => {
+                    // Another live session of the same app is being ducked right now; it carries
+                    // its own base volume and restores it when released.
+                    log::debug!("dropping pending restore of {}: the app is ducked again", e.exe);
+                    false
+                }
+                Some((_, s)) => {
                     match s.set_volume(e.volume) {
-                        Ok(()) => log::info!("restored {} to {:.0}% after previous run", e.exe, e.volume * 100.0),
+                        Ok(()) => log::info!("restored {} to {:.0}% (left ducked earlier)", e.exe, e.volume * 100.0),
                         Err(err) => log::warn!("cannot restore {}: {err}", e.exe),
                     }
                     false
@@ -496,18 +620,7 @@ impl Engine {
 
     fn save_restore_file(&self) {
         let now = unix_now();
-        let mut file = RestoreFile { entries: Vec::new() };
-        for (key, m) in &self.managed {
-            if let Some(s) = self.audio.sessions.get(key) {
-                file.entries.push(RestoreEntry {
-                    instance_id: key.clone(),
-                    session_id: s.session_id.clone(),
-                    exe: s.label(),
-                    volume: m.base,
-                    saved_unix: now,
-                });
-            }
-        }
+        let mut file = RestoreFile { entries: self.managed.iter().map(|(key, m)| m.restore_entry(key, now)).collect() };
         file.entries.extend(self.pending_restore.iter().cloned());
         let path = restore_path();
         if file.entries.is_empty() {
@@ -530,11 +643,17 @@ impl Engine {
 /// Drives one session toward `gain` × the user's volume, taking ownership only while ducked.
 fn apply_gain(session: &Session, key: &str, gain: f32, managed: &mut HashMap<String, Managed>, dirty: &mut bool) {
     if gain >= 0.9995 {
-        if let Some(m) = managed.remove(key) {
-            if let Err(e) = session.set_volume(m.base) {
-                log::warn!("cannot restore volume of {}: {e}", session.label());
+        if let Some(mut m) = managed.remove(key) {
+            // A slider move during the last step of the fade still counts.
+            if let Ok(current) = session.volume()
+                && m.absorb_user_change(current)
+            {
+                log::info!("{} volume changed by user; new base {:.0}%", m.label, m.base * 100.0);
             }
-            log::debug!("released {} at {:.0}%", session.label(), m.base * 100.0);
+            if let Err(e) = session.set_volume(m.base) {
+                log::warn!("cannot restore volume of {}: {e}", m.label);
+            }
+            log::debug!("released {} at {:.0}%", m.label, m.base * 100.0);
             *dirty = true;
         }
         return;
@@ -549,19 +668,19 @@ fn apply_gain(session: &Session, key: &str, gain: f32, managed: &mut HashMap<Str
     };
     let m = match managed.get_mut(key) {
         Some(m) => {
-            if (current - m.last_written).abs() > USER_CHANGE_EPSILON {
-                // The user moved this app's slider while it was ducked: treat it as a new base.
-                m.base = (current / m.gain.max(0.05)).min(1.0);
-                m.last_written = current;
+            // The user moved this app's slider while it was ducked: treat it as a new base.
+            if m.absorb_user_change(current) {
                 *dirty = true;
-                log::info!("{} volume changed by user; new base {:.0}%", session.label(), m.base * 100.0);
+                log::info!("{} volume changed by user; new base {:.0}%", m.label, m.base * 100.0);
             }
             m
         }
         None => {
             log::debug!("ducking {} from {:.0}%", session.label(), current * 100.0);
             *dirty = true;
-            managed.entry(key.to_owned()).or_insert(Managed { base: current, last_written: current, gain: 1.0 })
+            managed
+                .entry(key.to_owned())
+                .or_insert_with(|| Managed::new(current, session.session_id.clone(), session.label()))
         }
     };
     m.gain = gain;
@@ -606,10 +725,11 @@ impl Selector {
         }
     }
 
-    fn matches(&self, s: &Session) -> bool {
+    /// `exe_norm` is the session's executable name as normalized by [`normalize_exe`].
+    fn matches(&self, is_system: bool, exe_norm: &str) -> bool {
         match self {
-            Selector::Exe(name) => !s.is_system && !s.exe_norm.is_empty() && s.exe_norm == *name,
-            Selector::System => s.is_system,
+            Selector::Exe(name) => !is_system && !exe_norm.is_empty() && exe_norm == name,
+            Selector::System => is_system,
             Selector::Others => false,
         }
     }
@@ -631,12 +751,84 @@ impl CompiledRule {
     }
 
     pub fn is_trigger(&self, s: &Session) -> bool {
-        self.triggers.iter().any(|m| m.matches(s))
+        self.is_trigger_app(s.is_system, &s.exe_norm)
+    }
+
+    pub fn is_target(&self, s: &Session) -> bool {
+        self.is_target_app(s.is_system, &s.exe_norm)
+    }
+
+    fn is_trigger_app(&self, is_system: bool, exe_norm: &str) -> bool {
+        self.triggers.iter().any(|m| m.matches(is_system, exe_norm))
     }
 
     /// Targets never include the rule's own triggers, which would otherwise duck themselves.
-    pub fn is_target(&self, s: &Session) -> bool {
-        !self.is_trigger(s)
-            && self.targets.iter().any(|m| matches!(m, Selector::Others) || m.matches(s))
+    fn is_target_app(&self, is_system: bool, exe_norm: &str) -> bool {
+        !self.is_trigger_app(is_system, exe_norm)
+            && self.targets.iter().any(|m| matches!(m, Selector::Others) || m.matches(is_system, exe_norm))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn compiled(triggers: Vec<AppMatcher>, targets: Vec<AppMatcher>) -> CompiledRule {
+        CompiledRule::new(&Rule { triggers, targets, ..Rule::default() })
+    }
+
+    fn exe(name: &str) -> AppMatcher {
+        AppMatcher::Process(name.to_owned())
+    }
+
+    #[test]
+    fn matching_ignores_case_and_exe_suffix() {
+        let r = compiled(vec![exe("Discord.EXE")], vec![exe("spotify")]);
+        assert!(r.is_trigger_app(false, "discord"));
+        assert!(r.is_target_app(false, "spotify"));
+        assert!(!r.is_target_app(false, "discord"));
+        assert!(!r.is_target_app(true, ""), "system sounds are not matched by a process name");
+        assert!(!r.is_target_app(false, ""), "sessions without a known exe never match by name");
+    }
+
+    #[test]
+    fn own_triggers_are_never_targets() {
+        let r = compiled(vec![exe("discord.exe"), AppMatcher::SystemSounds], vec![AppMatcher::AllOthers, exe("Discord")]);
+        assert!(!r.is_target_app(false, "discord"));
+        assert!(!r.is_target_app(true, ""));
+        assert!(r.is_target_app(false, "spotify"));
+        assert!(r.is_target_app(false, ""), "all other apps includes sessions without a known exe");
+    }
+
+    #[test]
+    fn user_change_rebases_volume() {
+        let mut m = Managed::new(0.8, String::new(), "app".into());
+        m.gain = 0.25;
+        m.last_written = 0.2;
+        assert!(!m.absorb_user_change(0.2 + USER_CHANGE_EPSILON / 2.0), "rounding noise is not a user change");
+        assert!(m.absorb_user_change(0.1));
+        assert!((m.base - 0.4).abs() < 1e-6, "ducked reading is scaled back up, got {}", m.base);
+        assert_eq!(m.last_written, 0.1);
+        assert!(m.absorb_user_change(0.5));
+        assert_eq!(m.base, 1.0, "base is capped at full volume");
+    }
+
+    #[test]
+    fn user_change_while_muted_is_taken_literally() {
+        let mut m = Managed::new(0.8, String::new(), "app".into());
+        m.gain = 0.0;
+        m.last_written = 0.0;
+        assert!(m.absorb_user_change(0.3));
+        assert!((m.base - 0.3).abs() < 1e-6, "a nudge while muted must not become full volume");
+    }
+
+    #[test]
+    fn restore_file_round_trips() {
+        let m = Managed::new(0.6, "{sid}|app.exe".into(), "app.exe".into());
+        let file = RestoreFile { entries: vec![m.restore_entry("inst-1", 42)] };
+        let back: RestoreFile = toml::from_str(&toml::to_string(&file).unwrap()).unwrap();
+        let e = &back.entries[0];
+        assert_eq!((e.instance_id.as_str(), e.session_id.as_str(), e.exe.as_str()), ("inst-1", "{sid}|app.exe", "app.exe"));
+        assert_eq!((e.volume, e.saved_unix), (0.6, 42));
     }
 }

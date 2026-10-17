@@ -18,7 +18,7 @@ use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError
 use windows::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows::Win32::System::Threading::{CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, SetEvent};
 use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
-use windows::core::w;
+use windows::core::HSTRING;
 
 use crate::config::Config;
 use crate::engine::{EngineHandle, Shared};
@@ -32,7 +32,15 @@ fn main() {
     }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         attach_console();
-        println!("LoudControl — per-app audio ducking\n\n  --minimized   start in the tray\n  --list        print audio sessions and their levels, then exit");
+        println!(
+            "LoudControl {} — per-app audio ducking\n\n  --minimized   start in the tray\n  --list        print audio sessions and their levels, then exit\n  --version     print the version, then exit",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        attach_console();
+        println!("LoudControl {}", env!("CARGO_PKG_VERSION"));
         return;
     }
 
@@ -42,8 +50,14 @@ fn main() {
 
     let dir = config::app_dir();
     logger::init(&dir.join("loudcontrol.log"), cfg!(debug_assertions));
-    std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        log::error!("panic in thread {}: {info}", thread.name().unwrap_or("unnamed"));
+    }));
     log::info!("LoudControl {} starting", env!("CARGO_PKG_VERSION"));
+    for unknown in args.iter().filter(|a| a.as_str() != "--minimized") {
+        log::warn!("ignoring unknown argument {unknown:?}");
+    }
 
     let (cfg, notice) = load_config();
     let start_hidden = args.iter().any(|a| a == "--minimized") || cfg.settings.start_minimized;
@@ -80,9 +94,20 @@ fn load_config() -> (Config, Option<String>) {
         Err(e) => {
             // Keep the broken file for the user instead of overwriting it.
             let backup = path.with_extension("broken.toml");
-            let _ = std::fs::copy(&path, &backup);
-            log::error!("config error, using defaults (backup at {}): {e}", backup.display());
-            (Config::default(), Some(format!("Config file was invalid and has been backed up to {}: {e}", backup.display())))
+            match std::fs::copy(&path, &backup) {
+                Ok(_) => {
+                    log::error!("config error, using defaults (backup at {}): {e}", backup.display());
+                    (Config::default(), Some(format!("Config file was invalid and has been backed up to {}: {e}", backup.display())))
+                }
+                Err(copy_err) => {
+                    log::error!("config error, using defaults without saving; backup failed ({copy_err}): {e}");
+                    config::set_saves_blocked(true);
+                    (
+                        Config::default(),
+                        Some(format!("Config file could not be loaded or backed up, so changes will not be saved this session ({copy_err}): {e}")),
+                    )
+                }
+            }
         }
     }
 }
@@ -91,10 +116,11 @@ fn load_config() -> (Config, Option<String>) {
 fn acquire_single_instance() -> bool {
     unsafe {
         // The handle is intentionally leaked: the mutex must live as long as the process.
-        let _ = CreateMutexW(None, true, w!("Local\\LoudControl.SingleInstance"));
+        let name = HSTRING::from(config::instance_object_name("SingleInstance"));
+        let _ = CreateMutexW(None, true, &name);
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = AllowSetForegroundWindow(ASFW_ANY);
-            if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, tray::SHOW_EVENT_NAME) {
+            if let Ok(event) = OpenEventW(EVENT_MODIFY_STATE, false, &tray::show_event_name()) {
                 let _ = SetEvent(event);
                 let _ = CloseHandle(event);
             }

@@ -55,6 +55,7 @@ pub struct Session {
     pub exe: String,
     pub exe_norm: String,
     pub is_system: bool,
+    pub device_id: String,
     pub device_name: String,
     meter: IAudioMeterInformation,
     volume: ISimpleAudioVolume,
@@ -187,12 +188,16 @@ impl AudioSystem {
         let mut seen: Vec<String> = Vec::with_capacity(self.sessions.len());
         let mut result = RefreshResult::default();
         let mut fresh: Vec<Session> = Vec::new();
+        // Devices whose enumeration failed this time; their known sessions are kept as they are,
+        // so a transient error does not look like every app on the device going away.
+        let mut failed: Vec<&str> = Vec::new();
 
-        for device in self.devices.values() {
+        for (device_id, device) in &self.devices {
             let list = match unsafe { device.manager.GetSessionEnumerator() } {
                 Ok(l) => l,
                 Err(e) => {
                     log::debug!("session enumeration failed on {}: {e}", device.name);
+                    failed.push(device_id.as_str());
                     continue;
                 }
             };
@@ -213,14 +218,14 @@ impl AudioSystem {
                 if self.sessions.contains_key(&instance_id) || fresh.iter().any(|s| s.instance_id == instance_id) {
                     continue;
                 }
-                if let Some(s) = open_session(&control, &control2, instance_id, &device.name, &mut self.exe_cache) {
+                if let Some(s) = open_session(&control, &control2, instance_id, device_id, &device.name, &mut self.exe_cache) {
                     fresh.push(s);
                 }
             }
         }
 
         self.sessions.retain(|id, s| {
-            let keep = seen.contains(id);
+            let keep = seen.contains(id) || failed.contains(&s.device_id.as_str());
             if !keep {
                 log::debug!("session gone: {} on {}", s.label(), s.device_name);
                 result.removed.push(id.clone());
@@ -243,6 +248,7 @@ fn open_session(
     control: &IAudioSessionControl,
     control2: &IAudioSessionControl2,
     instance_id: String,
+    device_id: &str,
     device_name: &str,
     exe_cache: &mut HashMap<u32, String>,
 ) -> Option<Session> {
@@ -264,6 +270,7 @@ fn open_session(
         exe_norm: normalize_exe(&exe),
         exe,
         is_system,
+        device_id: device_id.to_owned(),
         device_name: device_name.to_owned(),
         meter,
         volume,

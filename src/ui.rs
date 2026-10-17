@@ -42,6 +42,7 @@ const ICON_CHECK: &str = "\u{E73E}";
 const METER_MIN_DB: f32 = -66.0;
 const HISTORY_SECS: f64 = 8.0;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(600);
+const UNTITLED_RULE: &str = "Untitled rule";
 
 pub fn run(shared: Arc<Shared>, start_hidden: bool, notice: Option<String>) -> eframe::Result {
     let icon = egui::IconData { rgba: render_icon(64, IconState::Normal), width: 64, height: 64 };
@@ -186,6 +187,30 @@ impl App {
             log::error!("cannot save config: {e}");
             self.notice = Some((format!("Cannot save settings: {e}"), true));
         }
+    }
+
+    /// Replaces the configuration with one reloaded from disk, including the parts that live
+    /// outside the engine (the hotkey), and keeps the selected rule when it still exists.
+    fn apply_reloaded(&mut self, cfg: Config) {
+        config::set_saves_blocked(false);
+        let selected = match self.page {
+            Page::Rule(uid) => self.cfg.rules.iter().position(|r| r.uid == uid),
+            Page::Settings => None,
+        };
+        self.cfg = cfg;
+        let cfg = self.cfg.clone();
+        self.shared.update_config(|c| *c = cfg);
+        self.dirty_since = None;
+        if let Some(i) = selected {
+            self.page = self.cfg.rules.get(i).or(self.cfg.rules.last()).map(|r| Page::Rule(r.uid)).unwrap_or(Page::Settings);
+        }
+        self.confirm_delete = false;
+        self.hotkey_text = self.cfg.settings.pause_hotkey.clone();
+        self.hotkey_status = self.hotkey.set(&self.hotkey_text);
+        self.notice = match &self.hotkey_status {
+            Ok(()) => Some(("Configuration reloaded.".into(), false)),
+            Err(e) => Some((format!("Configuration reloaded, but the pause hotkey failed: {e}"), true)),
+        };
     }
 
     fn set_paused(&mut self, paused: bool) {
@@ -502,6 +527,7 @@ impl App {
                 let name = egui::TextEdit::singleline(&mut rule.name)
                     .font(FontId::proportional(22.0))
                     .frame(egui::Frame::NONE)
+                    .hint_text(UNTITLED_RULE)
                     .desired_width(ui.available_width() - 260.0);
                 changed |= ui.add(name).changed();
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -533,10 +559,10 @@ impl App {
                 ui.columns(2, |cols| {
                     cols[0].label(section_title("When sound plays in"));
                     cols[0].add_space(6.0);
-                    changed |= app_list(&mut cols[0], "triggers", &mut rule.triggers, &sessions, false, &mut self.manual_entry);
+                    changed |= app_list(&mut cols[0], "triggers", &mut rule.triggers, &rule.targets, &sessions, false, &mut self.manual_entry);
                     cols[1].label(section_title("Lower the volume of"));
                     cols[1].add_space(6.0);
-                    changed |= app_list(&mut cols[1], "targets", &mut rule.targets, &sessions, true, &mut self.manual_entry);
+                    changed |= app_list(&mut cols[1], "targets", &mut rule.targets, &rule.triggers, &sessions, true, &mut self.manual_entry);
                 });
             });
             ui.add_space(10.0);
@@ -723,12 +749,7 @@ impl App {
                 }
                 if ui.button("Reload config from disk").clicked() {
                     match Config::load(&config::config_path()) {
-                        Ok(cfg) => {
-                            self.cfg = cfg;
-                            let cfg = self.cfg.clone();
-                            self.shared.update_config(|c| *c = cfg);
-                            self.notice = Some(("Configuration reloaded.".into(), false));
-                        }
+                        Ok(cfg) => self.apply_reloaded(cfg),
                         Err(e) => self.notice = Some((format!("Config error: {e}"), true)),
                     }
                 }
@@ -982,10 +1003,36 @@ fn threshold_slider(ui: &mut Ui, threshold_db: &mut f32, level_db: f32) -> egui:
         }
     }
     if response.hovered() {
-        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-        if scroll != 0.0 {
-            *threshold_db = (*threshold_db + scroll.signum()).clamp(METER_MIN_DB, 0.0);
-            response.mark_changed();
+        // One wheel notch is 1 dB. Raw wheel events are counted because the smoothed delta
+        // spreads a notch over several frames; the scroll is consumed so the page stays put.
+        let steps: f32 = ui.input(|i| {
+            i.events
+                .iter()
+                .map(|e| match e {
+                    egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                        egui::MouseWheelUnit::Line => delta.y,
+                        egui::MouseWheelUnit::Point => delta.y / 40.0,
+                        egui::MouseWheelUnit::Page => delta.y * 10.0,
+                    },
+                    _ => 0.0,
+                })
+                .sum()
+        });
+        ui.ctx().input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+        let acc_id = response.id.with("wheel");
+        let whole = ui.data_mut(|d| {
+            let acc = d.get_temp_mut_or_default::<f32>(acc_id);
+            *acc += steps;
+            let whole = acc.trunc();
+            *acc -= whole;
+            whole
+        });
+        if whole != 0.0 {
+            let db = (threshold_db.round() + whole).clamp(METER_MIN_DB, 0.0);
+            if db != *threshold_db {
+                *threshold_db = db;
+                response.mark_changed();
+            }
         }
     }
 
@@ -1134,7 +1181,8 @@ fn rule_card(ui: &mut Ui, rule: &mut Rule, view: &RuleView, selected: bool) -> (
             }
             ui.painter().circle_filled(r.center(), 4.0, color);
             let name_color = if rule.enabled { TEXT } else { MUTED };
-            ui.add(egui::Label::new(semibold(rule.name.clone()).color(name_color)).truncate().selectable(false));
+            let name = if rule.name.trim().is_empty() { UNTITLED_RULE } else { rule.name.as_str() };
+            ui.add(egui::Label::new(semibold(name).color(name_color)).truncate().selectable(false));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 toggled = toggle(ui, &mut rule.enabled).changed();
             });
@@ -1192,6 +1240,7 @@ fn app_list(
     ui: &mut Ui,
     id: &str,
     list: &mut Vec<AppMatcher>,
+    other: &[AppMatcher],
     sessions: &[SessionView],
     is_targets: bool,
     manual: &mut String,
@@ -1200,7 +1249,8 @@ fn app_list(
     let mut remove = None;
     ui.horizontal_wrapped(|ui| {
         for (i, m) in list.iter().enumerate() {
-            let running = sessions.iter().any(|s| session_matcher(s).is_some_and(|sm| &sm == m) || *m == AppMatcher::AllOthers);
+            let running = *m == AppMatcher::AllOthers && !sessions.is_empty()
+                || sessions.iter().any(|s| session_matcher(s).is_some_and(|sm| same_app(&sm, m)));
             if chip(ui, &m.label(), running, is_targets) {
                 remove = Some(i);
             }
@@ -1216,7 +1266,11 @@ fn app_list(
                         continue;
                     }
                     seen.push(m.clone());
-                    if ui.button(m.label()).clicked() {
+                    // A rule's own triggers are never ducked, so an app cannot be on both sides.
+                    let elsewhere = contains_app(other, &m);
+                    let hint = if is_targets { "Already a trigger of this rule" } else { "Already lowered by this rule" };
+                    let button = ui.add_enabled(!elsewhere, egui::Button::new(m.label())).on_disabled_hover_text(hint);
+                    if button.clicked() {
                         list.push(m);
                         changed = true;
                         ui.close();
@@ -1299,13 +1353,16 @@ fn session_matcher(s: &SessionView) -> Option<AppMatcher> {
     }
 }
 
+/// Matchers name the same app the way the engine compares them (case and `.exe` ignored).
+fn same_app(a: &AppMatcher, b: &AppMatcher) -> bool {
+    match (a, b) {
+        (AppMatcher::Process(x), AppMatcher::Process(y)) => config::normalize_exe(x) == config::normalize_exe(y),
+        _ => a == b,
+    }
+}
+
 fn contains_app(list: &[AppMatcher], m: &AppMatcher) -> bool {
-    let norm = |m: &AppMatcher| match m {
-        AppMatcher::Process(n) => AppMatcher::Process(config::normalize_exe(n)),
-        other => other.clone(),
-    };
-    let target = norm(m);
-    list.iter().any(|x| norm(x) == target)
+    list.iter().any(|x| same_app(x, m))
 }
 
 /// One live session: name, device, meter, applied ducking, quick add-to-rule buttons.
@@ -1383,10 +1440,5 @@ fn toggle_in(list: &mut Vec<AppMatcher>, m: &AppMatcher) {
 }
 
 fn remove_from(list: &mut Vec<AppMatcher>, m: &AppMatcher) {
-    let norm = |m: &AppMatcher| match m {
-        AppMatcher::Process(n) => AppMatcher::Process(config::normalize_exe(n)),
-        other => other.clone(),
-    };
-    let target = norm(m);
-    list.retain(|x| norm(x) != target);
+    list.retain(|x| !same_app(x, m));
 }

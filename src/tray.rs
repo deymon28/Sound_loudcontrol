@@ -14,12 +14,14 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 use crate::icon_art::{IconState, render_icon};
 
 /// Named event a second launch of the program signals to open the running instance's window.
-pub const SHOW_EVENT_NAME: windows::core::PCWSTR = windows::core::w!("Local\\LoudControl.Show");
+pub fn show_event_name() -> windows::core::HSTRING {
+    crate::config::instance_object_name("Show").into()
+}
 
-/// Listens for [`SHOW_EVENT_NAME`] on a background thread.
+/// Listens for [`show_event_name`] on a background thread.
 pub fn spawn_show_listener(queue: EventQueue) {
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
-    let event = match unsafe { CreateEventW(None, false, false, SHOW_EVENT_NAME) } {
+    let event = match unsafe { CreateEventW(None, false, false, &show_event_name()) } {
         // HANDLE is not Send; pass the raw value to the thread, which owns it for the process lifetime.
         Ok(h) => h.0 as isize,
         Err(e) => {
@@ -166,23 +168,32 @@ impl PauseHotkey {
     }
 
     /// Registers `text` (e.g. `Ctrl+Alt+M`) replacing the previous hotkey. Empty text disables it.
+    /// On error the previous hotkey stays active.
     pub fn set(&mut self, text: &str) -> Result<(), String> {
         let Some(manager) = &self.manager else { return Err("global hotkeys are unavailable".into()) };
-        if let Some(old) = self.current.take() {
-            let _ = manager.unregister(old);
-            self.active_id.store(0, Ordering::Relaxed);
-        }
         let text = text.trim();
-        if text.is_empty() {
+        let hotkey = if text.is_empty() {
+            None
+        } else {
+            Some(HotKey::from_str(text).map_err(|e| format!("invalid shortcut \"{text}\": {e}"))?)
+        };
+        if hotkey == self.current {
             return Ok(());
         }
-        let hotkey = HotKey::from_str(text).map_err(|e| e.to_string())?;
-        manager
-            .register(hotkey)
-            .map_err(|e| format!("cannot register {text}: {e} (maybe used by another app)"))?;
-        self.active_id.store(hotkey.id(), Ordering::Relaxed);
-        self.current = Some(hotkey);
-        log::info!("pause hotkey set to {text}");
+        if let Some(new) = hotkey {
+            manager
+                .register(new)
+                .map_err(|e| format!("cannot register {text}: {e} (maybe used by another app)"))?;
+        }
+        if let Some(old) = self.current.take() {
+            let _ = manager.unregister(old);
+        }
+        self.active_id.store(hotkey.map_or(0, |h| h.id()), Ordering::Relaxed);
+        self.current = hotkey;
+        match hotkey {
+            Some(_) => log::info!("pause hotkey set to {text}"),
+            None => log::info!("pause hotkey disabled"),
+        }
         Ok(())
     }
 }

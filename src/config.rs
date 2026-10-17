@@ -176,9 +176,20 @@ impl Config {
 
     /// Writes atomically: a temp file is renamed over the target so a crash never leaves half a file.
     pub fn save(&self, path: &Path) -> Result<(), String> {
+        if SAVES_BLOCKED.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err("the existing config file could not be loaded or backed up, so it is left untouched".into());
+        }
         let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
         write_atomic(path, text.as_bytes())
     }
+}
+
+static SAVES_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// While blocked, [`Config::save`] does not write, so a config file that could not be read or
+/// backed up is never replaced by defaults. A successful reload unblocks it.
+pub fn set_saves_blocked(blocked: bool) {
+    SAVES_BLOCKED.store(blocked, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Process-wide unique rule id.
@@ -214,6 +225,21 @@ pub fn app_dir() -> PathBuf {
 
 pub fn config_path() -> PathBuf {
     app_dir().join("config.toml")
+}
+
+/// Name of a per-user kernel object (single-instance mutex, activation event). A custom
+/// `LOUDCONTROL_HOME` gets its own names, so a scratch instance used for testing runs next to
+/// the normal one instead of activating it.
+pub fn instance_object_name(base: &str) -> String {
+    match std::env::var_os("LOUDCONTROL_HOME") {
+        None => format!("Local\\LoudControl.{base}"),
+        Some(home) => {
+            let key = home.to_string_lossy().to_lowercase();
+            // FNV-1a: stable across builds, unlike std's hasher.
+            let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+            format!("Local\\LoudControl.{base}.{hash:016x}")
+        }
+    }
 }
 
 #[cfg(test)]
