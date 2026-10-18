@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::{AudioSystem, Session};
 use crate::config::{self, AppMatcher, Config, Rule, normalize_exe};
-use crate::dsp::{self, RuleState};
+use crate::dsp::{self, MirrorFilter, RuleState};
 use crate::timer::Ticker;
 
 /// Poll interval when no trigger application is running.
@@ -241,6 +241,8 @@ struct Engine {
     pending_restore: Vec<RestoreEntry>,
     restore_dirty: bool,
     meters: HashMap<String, f32>,
+    /// Per session: whether its meter also carries other apps' sound.
+    mirrors: HashMap<String, MirrorFilter>,
     rule_meters: HashMap<u64, f32>,
     last_telemetry: Instant,
     was_ducking: bool,
@@ -355,6 +357,7 @@ impl Engine {
             pending_restore,
             restore_dirty: true,
             meters: HashMap::new(),
+            mirrors: HashMap::new(),
             rule_meters: HashMap::new(),
             last_telemetry: Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now),
             was_ducking: false,
@@ -386,6 +389,7 @@ impl Engine {
             let refreshed = self.audio.refresh(false);
             for id in &refreshed.removed {
                 self.meters.remove(id);
+                self.mirrors.remove(id);
                 if let Some(m) = self.managed.remove(id) {
                     // The app closed (or lost its device) while ducked. Windows remembers the
                     // lowered volume for the app's next start, so the user's volume is handed
@@ -420,12 +424,49 @@ impl Engine {
         let ui_visible = self.shared.ui_visible();
         let publish = self.last_telemetry.elapsed() >= Duration::from_millis(if ui_visible { 30 } else { 250 });
 
-        // Peak per session, read once per tick. Non-trigger sessions are only metered for the UI.
-        let mut peaks: HashMap<&str, f32> = HashMap::with_capacity(self.audio.sessions.len());
+        // Peak and output (peak × volume) per session, read once per tick. Other sessions are read
+        // when they share a device with a trigger, to tell a trigger's own sound from a copy of
+        // theirs (see `dsp::MirrorFilter`), or for the UI.
+        let read_all = ui_visible && publish;
+        let trigger_devices: Vec<&str> = self
+            .audio
+            .sessions
+            .values()
+            .filter(|s| self.cfg.rules.iter().zip(&self.compiled).any(|(r, c)| r.enabled && c.is_trigger(s)))
+            .map(|s| s.device_id.as_str())
+            .collect();
+        let mut raw: HashMap<&str, (f32, f32)> = HashMap::with_capacity(self.audio.sessions.len());
         for (key, s) in &self.audio.sessions {
-            let is_trigger = self.cfg.rules.iter().zip(&self.compiled).any(|(r, c)| r.enabled && c.is_trigger(s));
-            if is_trigger || (ui_visible && publish) {
-                peaks.insert(key.as_str(), s.peak());
+            if read_all || trigger_devices.contains(&s.device_id.as_str()) {
+                let peak = s.peak();
+                raw.insert(key.as_str(), (peak, peak * s.volume().unwrap_or(1.0)));
+            }
+        }
+        let mut peaks: HashMap<&str, f32> = HashMap::with_capacity(raw.len());
+        for (key, s) in &self.audio.sessions {
+            let Some(&(own, _)) = raw.get(key.as_str()) else { continue };
+            let (mut others_max, mut others_sum) = (0.0f32, 0.0f32);
+            for (other_key, other) in &self.audio.sessions {
+                if other_key != key
+                    && other.device_id == s.device_id
+                    && let Some(&(_, output)) = raw.get(other_key.as_str())
+                {
+                    others_max = others_max.max(output);
+                    others_sum += output;
+                }
+            }
+            if !self.mirrors.contains_key(key) {
+                self.mirrors.insert(key.clone(), MirrorFilter::default());
+            }
+            let filter = self.mirrors.get_mut(key).expect("inserted above");
+            let was_mirror = filter.is_mirror();
+            peaks.insert(key.as_str(), filter.update(own, others_max, others_sum));
+            if filter.is_mirror() != was_mirror {
+                if filter.is_mirror() {
+                    log::info!("{} on {} also carries other apps' sound; only its own sound counts", s.label(), s.device_name);
+                } else {
+                    log::info!("{} on {} no longer carries other apps' sound", s.label(), s.device_name);
+                }
             }
         }
 

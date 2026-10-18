@@ -71,6 +71,15 @@ again. After repeated failures it stops and shows an error in the window.
 Session peak meters measure the signal before the session volume. Ducking a target therefore
 never changes its own meter reading, and a trigger's mixer slider does not affect detection.
 
+Some apps record the output device they play to, for example Discord during a call. Windows
+counts that recording on the app's own session meter, so a game's sound shows up as Discord
+sound (the Windows volume mixer shows the same). LoudControl recognizes such a meter: it
+matches the loudest other app on the device while the app is silent, and rises above everything
+when the app plays its own sound. From then on only sound clearly louder (by more than 1 dB) than
+the other apps on that device counts for the app, both for triggering and in the meters. It takes
+a few moments of the app's own sound over other audio (someone speaking while the game plays)
+to recognize this, so a mirrored game can still trigger a duck right after the app starts.
+
 ## Configuration
 
 Settings are stored in `%APPDATA%\LoudControl\config.toml`. Changes made in the UI are saved
@@ -117,6 +126,9 @@ Logs go to `%APPDATA%\LoudControl\loudcontrol.log` with UTC timestamps. The file
   ducking it lowers the whole browser. A desktop music client avoids this.
 - Matching is by executable name. Apps that play audio through a helper process (some
   Electron and UWP apps) have to be matched by that helper's name. `--list` shows it.
+- While an app's meter mirrors other apps (see above), its own sound counts only when it is
+  louder than the other apps on the same device. Speech quieter than the game is not detected.
+  `--list` shows the raw, unfiltered meters.
 - `taskkill` without `/F` cannot close the app gracefully while it sits in the tray. Use the
   tray menu's **Quit**. A forced kill is still covered by the restore-on-next-launch fallback.
 
