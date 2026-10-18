@@ -43,6 +43,13 @@ const METER_MIN_DB: f32 = -66.0;
 const HISTORY_SECS: f64 = 8.0;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(600);
 const UNTITLED_RULE: &str = "Untitled rule";
+/// Narrowest the middle column (with its margins) may get before the session panel shrinks.
+const CENTER_MIN_WIDTH: f32 = 420.0;
+const SESSIONS_MIN_WIDTH: f32 = 220.0;
+/// Below this content width, parameter labels go above their controls.
+const NARROW_ROW_WIDTH: f32 = 400.0;
+/// Below this card width, the trigger and target lists are stacked instead of side by side.
+const APP_COLUMNS_MIN_WIDTH: f32 = 440.0;
 
 pub fn run(shared: Arc<Shared>, start_hidden: bool, notice: Option<String>) -> eframe::Result {
     let icon = egui::IconData { rgba: render_icon(64, IconState::Normal), width: 64, height: 64 };
@@ -59,7 +66,16 @@ pub fn run(shared: Arc<Shared>, start_hidden: bool, notice: Option<String>) -> e
     // Debug aid: render offscreen, save a screenshot and quit.
     #[cfg(debug_assertions)]
     let viewport = if std::env::var_os("LOUDCONTROL_SCREENSHOT").is_some() {
-        viewport.with_position([-4000.0, 40.0]).with_active(false).with_visible(true)
+        // Optional `LOUDCONTROL_SCREENSHOT_SIZE=860x560` checks other window sizes.
+        let size = std::env::var("LOUDCONTROL_SCREENSHOT_SIZE").ok().and_then(|s| {
+            let (w, h) = s.split_once('x')?;
+            Some([w.trim().parse::<f32>().ok()?, h.trim().parse::<f32>().ok()?])
+        });
+        let viewport = viewport.with_position([-4000.0, 40.0]).with_active(false).with_visible(true);
+        match size {
+            Some(size) => viewport.with_inner_size(size),
+            None => viewport,
+        }
     } else {
         viewport
     };
@@ -304,18 +320,23 @@ impl eframe::App for App {
             .show_separator_line(false)
             .show(ui, |ui| self.top_bar(ui));
 
+        // Side panels give way on narrow windows so the editor in the middle keeps its width.
+        let total = ui.available_width();
+        let rules_width = if total < 1000.0 { 210.0 } else { 250.0 };
+        let sessions_max = (total - rules_width - CENTER_MIN_WIDTH).clamp(SESSIONS_MIN_WIDTH, 460.0);
+
         egui::Panel::left("rules")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 12)))
             .resizable(false)
-            .exact_size(250.0)
+            .exact_size(rules_width)
             .show_separator_line(false)
             .show(ui, |ui| self.rule_list(ui));
 
         egui::Panel::right("sessions")
             .frame(egui::Frame::new().fill(PANEL).inner_margin(Margin::symmetric(12, 12)))
             .resizable(true)
-            .default_size(300.0)
-            .size_range(240.0..=460.0)
+            .default_size(300.0_f32.min(sessions_max))
+            .size_range(SESSIONS_MIN_WIDTH..=sessions_max)
             .show_separator_line(false)
             .show(ui, |ui| self.session_list(ui));
 
@@ -528,7 +549,7 @@ impl App {
                     .font(FontId::proportional(22.0))
                     .frame(egui::Frame::NONE)
                     .hint_text(UNTITLED_RULE)
-                    .desired_width(ui.available_width() - 260.0);
+                    .desired_width((ui.available_width() - 170.0).max(120.0));
                 changed |= ui.add(name).changed();
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if self.confirm_delete {
@@ -556,14 +577,17 @@ impl App {
 
             // Apps.
             card(ui, |ui| {
-                ui.columns(2, |cols| {
-                    cols[0].label(section_title("When sound plays in"));
-                    cols[0].add_space(6.0);
-                    changed |= app_list(&mut cols[0], "triggers", &mut rule.triggers, &rule.targets, &sessions, false, &mut self.manual_entry);
-                    cols[1].label(section_title("Lower the volume of"));
-                    cols[1].add_space(6.0);
-                    changed |= app_list(&mut cols[1], "targets", &mut rule.targets, &rule.triggers, &sessions, true, &mut self.manual_entry);
-                });
+                let manual = &mut self.manual_entry;
+                if ui.available_width() >= APP_COLUMNS_MIN_WIDTH {
+                    ui.columns(2, |cols| {
+                        changed |= apps_section(&mut cols[0], false, &mut rule.triggers, &rule.targets, &sessions, manual);
+                        changed |= apps_section(&mut cols[1], true, &mut rule.targets, &rule.triggers, &sessions, manual);
+                    });
+                } else {
+                    changed |= apps_section(ui, false, &mut rule.triggers, &rule.targets, &sessions, manual);
+                    ui.add_space(10.0);
+                    changed |= apps_section(ui, true, &mut rule.targets, &rule.triggers, &sessions, manual);
+                }
             });
             ui.add_space(10.0);
 
@@ -718,7 +742,7 @@ impl App {
                     }
                     Ok(()) => {}
                     Err(e) => {
-                        ui.label(RichText::new(e).color(DANGER));
+                        ui.add(egui::Label::new(RichText::new(e).color(DANGER)).wrap());
                     }
                 }
                 false
@@ -938,7 +962,8 @@ fn toggle(ui: &mut Ui, on: &mut bool) -> egui::Response {
         response.mark_changed();
     }
     let t = ui.ctx().animate_bool_responsive(response.id, *on);
-    let track = egui::lerp(egui::Rgba::from(CARD_HI)..=egui::Rgba::from(ACCENT), t);
+    // The off track must stand out from both card colours, including a selected card.
+    let track = egui::lerp(egui::Rgba::from(FAINT)..=egui::Rgba::from(ACCENT), t);
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(11), Color32::from(track));
     if response.hovered() {
@@ -969,7 +994,17 @@ fn segmented<T: PartialEq + Copy>(ui: &mut Ui, value: &mut T, options: &[(T, &st
 }
 
 /// One labelled parameter row with a hover explanation.
+/// On narrow layouts the label goes on its own line above the control.
 fn param_row(ui: &mut Ui, label: &str, hint: &str, add: impl FnOnce(&mut Ui) -> bool, changed: &mut bool) {
+    if ui.available_width() < NARROW_ROW_WIDTH {
+        ui.add(egui::Label::new(RichText::new(label).size(14.0).color(MUTED)).selectable(false)).on_hover_text(hint);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().slider_width = (ui.available_width() - 130.0).clamp(120.0, 340.0);
+            *changed |= add(ui);
+        });
+        ui.add_space(4.0);
+        return;
+    }
     ui.horizontal(|ui| {
         let (r, _) = ui.allocate_exact_size(vec2(150.0, 26.0), Sense::hover());
         ui.painter().text(pos2(r.left(), r.center().y), Align2::LEFT_CENTER, label, FontId::proportional(14.0), MUTED);
@@ -1182,7 +1217,11 @@ fn rule_card(ui: &mut Ui, rule: &mut Rule, view: &RuleView, selected: bool) -> (
             ui.painter().circle_filled(r.center(), 4.0, color);
             let name_color = if rule.enabled { TEXT } else { MUTED };
             let name = if rule.name.trim().is_empty() { UNTITLED_RULE } else { rule.name.as_str() };
-            ui.add(egui::Label::new(semibold(name).color(name_color)).truncate().selectable(false));
+            // Leave room for the switch, or a long name runs underneath it.
+            let name_width = (ui.available_width() - 48.0).max(20.0);
+            ui.allocate_ui_with_layout(vec2(name_width, 20.0), Layout::left_to_right(Align::Center), |ui| {
+                ui.add(egui::Label::new(semibold(name).color(name_color)).truncate().selectable(false));
+            });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 toggled = toggle(ui, &mut rule.enabled).changed();
             });
@@ -1235,10 +1274,23 @@ fn status_line(ui: &mut Ui, rule: &Rule, view: &RuleView, paused: bool) {
     ui.label(RichText::new(text).color(color));
 }
 
+/// Titled trigger or target list of a rule.
+fn apps_section(
+    ui: &mut Ui,
+    is_targets: bool,
+    list: &mut Vec<AppMatcher>,
+    other: &[AppMatcher],
+    sessions: &[SessionView],
+    manual: &mut String,
+) -> bool {
+    ui.label(section_title(if is_targets { "Lower the volume of" } else { "When sound plays in" }));
+    ui.add_space(6.0);
+    app_list(ui, list, other, sessions, is_targets, manual)
+}
+
 /// Editable list of matchers as chips, plus an "Add" menu with running apps and manual entry.
 fn app_list(
     ui: &mut Ui,
-    id: &str,
     list: &mut Vec<AppMatcher>,
     other: &[AppMatcher],
     sessions: &[SessionView],
@@ -1255,57 +1307,55 @@ fn app_list(
                 remove = Some(i);
             }
         }
-        ui.push_id(id, |ui| {
-            ui.menu_button(RichText::new(format!("{ICON_ADD}  Add")).color(ACCENT), |ui| {
-                ui.set_min_width(240.0);
-                ui.label(RichText::new("Playing now").size(12.0).color(MUTED));
-                let mut seen: Vec<AppMatcher> = Vec::new();
-                for s in sessions {
-                    let Some(m) = session_matcher(s) else { continue };
-                    if contains_app(list, &m) || seen.contains(&m) {
-                        continue;
-                    }
-                    seen.push(m.clone());
-                    // A rule's own triggers are never ducked, so an app cannot be on both sides.
-                    let elsewhere = contains_app(other, &m);
-                    let hint = if is_targets { "Already a trigger of this rule" } else { "Already lowered by this rule" };
-                    let button = ui.add_enabled(!elsewhere, egui::Button::new(m.label())).on_disabled_hover_text(hint);
-                    if button.clicked() {
+        ui.menu_button(RichText::new(format!("{ICON_ADD}  Add")).color(ACCENT), |ui| {
+            ui.set_min_width(240.0);
+            ui.label(RichText::new("Playing now").size(12.0).color(MUTED));
+            let mut seen: Vec<AppMatcher> = Vec::new();
+            for s in sessions {
+                let Some(m) = session_matcher(s) else { continue };
+                if contains_app(list, &m) || seen.contains(&m) {
+                    continue;
+                }
+                seen.push(m.clone());
+                // A rule's own triggers are never ducked, so an app cannot be on both sides.
+                let elsewhere = contains_app(other, &m);
+                let hint = if is_targets { "Already a trigger of this rule" } else { "Already lowered by this rule" };
+                let button = ui.add_enabled(!elsewhere, egui::Button::new(m.label())).on_disabled_hover_text(hint);
+                if button.clicked() {
+                    list.push(m);
+                    changed = true;
+                    ui.close();
+                }
+            }
+            if seen.is_empty() {
+                ui.label(RichText::new("nothing else is playing").color(FAINT));
+            }
+            ui.separator();
+            if !list.contains(&AppMatcher::SystemSounds) && ui.button("System sounds").clicked() {
+                list.push(AppMatcher::SystemSounds);
+                changed = true;
+                ui.close();
+            }
+            if is_targets && !list.contains(&AppMatcher::AllOthers) && ui.button("All other apps").on_hover_text("Everything except this rule's trigger apps").clicked() {
+                list.push(AppMatcher::AllOthers);
+                changed = true;
+                ui.close();
+            }
+            ui.separator();
+            ui.label(RichText::new("By program name").size(12.0).color(MUTED));
+            ui.horizontal(|ui| {
+                let edit = ui.add(egui::TextEdit::singleline(manual).hint_text("e.g. Spotify.exe").desired_width(150.0));
+                let submit = ui.button("Add").clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                let name = manual.trim().to_owned();
+                if submit && !name.is_empty() {
+                    let m = AppMatcher::Process(name);
+                    if !contains_app(list, &m) {
                         list.push(m);
                         changed = true;
-                        ui.close();
                     }
-                }
-                if seen.is_empty() {
-                    ui.label(RichText::new("nothing else is playing").color(FAINT));
-                }
-                ui.separator();
-                if !list.contains(&AppMatcher::SystemSounds) && ui.button("System sounds").clicked() {
-                    list.push(AppMatcher::SystemSounds);
-                    changed = true;
+                    manual.clear();
                     ui.close();
                 }
-                if is_targets && !list.contains(&AppMatcher::AllOthers) && ui.button("All other apps").on_hover_text("Everything except this rule's trigger apps").clicked() {
-                    list.push(AppMatcher::AllOthers);
-                    changed = true;
-                    ui.close();
-                }
-                ui.separator();
-                ui.label(RichText::new("By program name").size(12.0).color(MUTED));
-                ui.horizontal(|ui| {
-                    let edit = ui.add(egui::TextEdit::singleline(manual).hint_text("e.g. Spotify.exe").desired_width(150.0));
-                    let submit = ui.button("Add").clicked() || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                    let name = manual.trim().to_owned();
-                    if submit && !name.is_empty() {
-                        let m = AppMatcher::Process(name);
-                        if !contains_app(list, &m) {
-                            list.push(m);
-                            changed = true;
-                        }
-                        manual.clear();
-                        ui.close();
-                    }
-                });
             });
         });
     });
@@ -1323,6 +1373,14 @@ fn app_list(
 fn chip(ui: &mut Ui, text: &str, running: bool, is_target: bool) -> bool {
     let color = if is_target { DUCK } else { ACCENT };
     let mut remove = false;
+    // A wrapping layout cannot wrap a frame before it is drawn, so measure the chip and start
+    // a new row when it would overflow; otherwise it widens the whole editor.
+    let text_width = ui.painter().layout_no_wrap(text.to_owned(), egui::TextStyle::Body.resolve(ui.style()), TEXT).size().x;
+    let chip_width = text_width + 40.0;
+    let left_in_row = ui.available_size_before_wrap().x;
+    if left_in_row < chip_width && left_in_row < ui.max_rect().width() - 1.0 {
+        ui.end_row();
+    }
     egui::Frame::new()
         .fill(color.gamma_multiply(0.14))
         .stroke(Stroke::new(1.0, color.gamma_multiply(if running { 0.7 } else { 0.25 })))
