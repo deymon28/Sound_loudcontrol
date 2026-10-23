@@ -71,14 +71,17 @@ again. After repeated failures it stops and shows an error in the window.
 Session peak meters measure the signal before the session volume. Ducking a target therefore
 never changes its own meter reading, and a trigger's mixer slider does not affect detection.
 
-Some apps record the output device they play to, for example Discord during a call. Windows
-counts that recording on the app's own session meter, so a game's sound shows up as Discord
-sound (the Windows volume mixer shows the same). LoudControl recognizes such a meter: it
-matches the loudest other app on the device while the app is silent, and rises above everything
+Some apps record the output device they play to: Discord during a call, and audio visualizers
+(for example a Stream Dock plugin running as `node20.exe`). Windows counts that recording on the
+app's own session meter, so a game's sound shows up as Discord sound (the Windows volume mixer
+shows the same). LoudControl recognizes such a mirroring meter: it equals the loudest of the
+other apps while the app is silent, never drops below any of them, and rises above all of them
 when the app plays its own sound. From then on only sound clearly louder (by more than 1 dB) than
-the other apps on that device counts for the app, both for triggering and in the meters. It takes
-a few moments of the app's own sound over other audio (someone speaking while the game plays)
-to recognize this, so a mirrored game can still trigger a duck right after the app starts.
+the other apps on that device counts for the app, both for triggering and in the meters. Other
+mirroring apps are left out of that comparison, because they carry the same sound, including the
+app's own. It takes a few moments of the app's own sound over other audio (someone speaking
+while the game plays) to recognize this, so a mirrored game can still trigger a duck right after
+the app starts. Ducking targets are never treated as mirrors.
 
 ## Configuration
 
@@ -128,6 +131,9 @@ Logs go to `%APPDATA%\LoudControl\loudcontrol.log` with UTC timestamps. The file
   Electron and UWP apps) have to be matched by that helper's name. `--list` shows it.
 - While an app's meter mirrors other apps (see above), its own sound counts only when it is
   louder than the other apps on the same device. Speech quieter than the game is not detected.
+  Two mirroring apps on one device carry the same sound, and no meter tells whose it is: a
+  visualizer shows Discord's speech as its own, so a visualizer as a trigger reacts to
+  Discord's speech too.
   `--list` shows the raw, unfiltered meters.
 - `taskkill` without `/F` cannot close the app gracefully while it sits in the tray. Use the
   tray menu's **Quit**. A forced kill is still covered by the restore-on-next-launch fallback.

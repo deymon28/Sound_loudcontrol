@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::{AudioSystem, Session};
 use crate::config::{self, AppMatcher, Config, Rule, normalize_exe};
-use crate::dsp::{self, MirrorFilter, RuleState};
+use crate::dsp::{self, MirrorFilter, OtherSession, RuleState};
 use crate::timer::Ticker;
 
 /// Poll interval when no trigger application is running.
@@ -435,32 +435,39 @@ impl Engine {
             .filter(|s| self.cfg.rules.iter().zip(&self.compiled).any(|(r, c)| r.enabled && c.is_trigger(s)))
             .map(|s| s.device_id.as_str())
             .collect();
-        let mut raw: HashMap<&str, (f32, f32)> = HashMap::with_capacity(self.audio.sessions.len());
+        let mut raw: HashMap<&str, (f32, OtherSession)> = HashMap::with_capacity(self.audio.sessions.len());
         for (key, s) in &self.audio.sessions {
             if read_all || trigger_devices.contains(&s.device_id.as_str()) {
                 let peak = s.peak();
-                raw.insert(key.as_str(), (peak, peak * s.volume().unwrap_or(1.0)));
+                let filter = self.mirrors.get(key);
+                let other = OtherSession {
+                    output: peak * s.volume().unwrap_or(1.0),
+                    mirror: filter.is_some_and(MirrorFilter::is_mirror),
+                    source: filter.is_some_and(MirrorFilter::is_source),
+                };
+                raw.insert(key.as_str(), (peak, other));
             }
         }
         let mut peaks: HashMap<&str, f32> = HashMap::with_capacity(raw.len());
+        let mut others: Vec<OtherSession> = Vec::new();
         for (key, s) in &self.audio.sessions {
             let Some(&(own, _)) = raw.get(key.as_str()) else { continue };
-            let (mut others_max, mut others_sum) = (0.0f32, 0.0f32);
+            others.clear();
             for (other_key, other) in &self.audio.sessions {
                 if other_key != key
                     && other.device_id == s.device_id
-                    && let Some(&(_, output)) = raw.get(other_key.as_str())
+                    && let Some(&(_, o)) = raw.get(other_key.as_str())
                 {
-                    others_max = others_max.max(output);
-                    others_sum += output;
+                    others.push(o);
                 }
             }
+            let is_target = self.cfg.rules.iter().zip(&self.compiled).any(|(r, c)| r.enabled && c.is_target(s));
             if !self.mirrors.contains_key(key) {
                 self.mirrors.insert(key.clone(), MirrorFilter::default());
             }
             let filter = self.mirrors.get_mut(key).expect("inserted above");
             let was_mirror = filter.is_mirror();
-            peaks.insert(key.as_str(), filter.update(own, others_max, others_sum));
+            peaks.insert(key.as_str(), filter.update(own, &others, !is_target));
             if filter.is_mirror() != was_mirror {
                 if filter.is_mirror() {
                     log::info!("{} on {} also carries other apps' sound; only its own sound counts", s.label(), s.device_name);

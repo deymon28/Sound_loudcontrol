@@ -104,11 +104,11 @@ fn approach(current: f32, target: f32, dt_ms: f32, attack_ms: f32, release_ms: f
 
 /// Other apps on the device count as playing from this level up.
 const MIRROR_AUDIBLE: f32 = 0.000_316; // -70 dBFS
-/// A reading this close to the loudest other app counts as a copy of it.
+/// A reading this close to a playing app counts as a copy of it.
 const MIRROR_MATCH_DB: f32 = 0.5;
-/// A reading this far above every other app is sound of the app's own.
+/// A reading this far above every playing app is sound of the app's own.
 const MIRROR_EXCESS_DB: f32 = 6.0;
-/// A reading this far below another app rules out a copy of the device output.
+/// A reading this far below another session rules out a copy of the device output.
 const MIRROR_BELOW_DB: f32 = 3.0;
 /// Own sound has to be this much louder than the other apps to count while mirroring.
 const MIRROR_MARGIN_DB: f32 = 1.0;
@@ -116,21 +116,36 @@ const MIRROR_ON_MATCHES: u32 = 60;
 const MIRROR_ON_EXCESS: u32 = 5;
 const MIRROR_MAX_SCORE: u32 = 200;
 const MIRROR_BELOW_PENALTY: u32 = 8;
+/// A session stays a known source for this many updates after it was last below another one.
+const SOURCE_TTL: u32 = 500;
 
-/// Some apps keep a copy of the device output inside their own audio session. Discord, for
-/// example, records the output it plays to, and Windows counts that recording on Discord's
-/// session meter, so game sound reads as Discord sound. Such a meter equals the loudest other
-/// app whenever the app itself is silent, rises above everything while it plays its own sound,
-/// and never drops below the others. The source of the copied sound shows the same equality but
-/// never rises above the copy, so it is not mistaken for a mirror.
+/// What a `MirrorFilter` needs to know about another session on the same device.
+#[derive(Debug, Clone, Copy)]
+pub struct OtherSession {
+    /// Peak × session volume: what the session adds to the device output.
+    pub output: f32,
+    pub mirror: bool,
+    pub source: bool,
+}
+
+/// Some apps keep a copy of the device output inside their own audio session. Discord records
+/// the output it plays to during a call, and audio visualizers record it to draw it; Windows
+/// counts that recording on the app's session meter, so game sound reads as the app's sound.
+///
+/// A copy never reads below any other session on the device; an app that does is a known
+/// source of sound. A session is recognized as a mirror when it repeatedly equals a known source
+/// and also rises well above every known source (its own sound, or the sound of another
+/// mirroring app, which no meter can tell apart). Other mirrors are never a reference: they
+/// carry the same sound, including the app's own.
 ///
 /// Once a session is recognized as a mirror, only sound clearly louder than the other apps on
-/// its device counts.
+/// its device that are not mirrors counts.
 #[derive(Debug, Clone, Default)]
 pub struct MirrorFilter {
     score: u32,
     excess: u32,
     mirror: bool,
+    source_left: u32,
 }
 
 impl MirrorFilter {
@@ -138,29 +153,46 @@ impl MirrorFilter {
         self.mirror
     }
 
-    /// `own` is the session's peak; `others_max` and `others_sum` are the loudest and the summed
-    /// output (peak × volume) of the other sessions on the same device. Returns the peak that
-    /// belongs to the app itself.
-    pub fn update(&mut self, own: f32, others_max: f32, others_sum: f32) -> f32 {
-        if others_max >= MIRROR_AUDIBLE {
-            let diff_db = lin_to_db(own) - lin_to_db(others_max);
+    /// Whether the session was recently quieter than another one, which a copy never is.
+    pub fn is_source(&self) -> bool {
+        self.source_left > 0
+    }
+
+    /// `own` is the session's peak and `others` are the other sessions on the same device, as of
+    /// the previous update. `may_mirror` is false for sessions that must always count as sources
+    /// (ducking targets: taking one for a mirror would let its own sound keep itself ducked).
+    /// Returns the peak that belongs to the app itself.
+    pub fn update(&mut self, own: f32, others: &[OtherSession], may_mirror: bool) -> f32 {
+        let all_max = others.iter().map(|o| o.output).fold(0.0, f32::max);
+        let source_max = others.iter().filter(|o| o.source).map(|o| o.output).fold(0.0, f32::max);
+        let own_db = lin_to_db(own);
+        self.source_left = self.source_left.saturating_sub(1);
+        if all_max >= MIRROR_AUDIBLE && own_db <= lin_to_db(all_max) - MIRROR_BELOW_DB {
+            self.source_left = SOURCE_TTL;
+            self.score = self.score.saturating_sub(MIRROR_BELOW_PENALTY);
+            if self.score == 0 {
+                self.excess = 0;
+            }
+        } else if source_max >= MIRROR_AUDIBLE {
+            let diff_db = own_db - lin_to_db(source_max);
             if diff_db.abs() <= MIRROR_MATCH_DB {
                 self.score = (self.score + 1).min(MIRROR_MAX_SCORE);
             } else if diff_db >= MIRROR_EXCESS_DB {
                 self.excess = (self.excess + 1).min(MIRROR_MAX_SCORE);
-            } else if diff_db <= -MIRROR_BELOW_DB {
-                self.score = self.score.saturating_sub(MIRROR_BELOW_PENALTY);
-                if self.score == 0 {
-                    self.excess = 0;
-                }
             }
+        }
+        if !may_mirror {
+            self.score = 0;
+            self.excess = 0;
         }
         if self.score >= MIRROR_ON_MATCHES && self.excess >= MIRROR_ON_EXCESS {
             self.mirror = true;
+            self.source_left = 0;
         } else if self.score == 0 {
             self.mirror = false;
         }
-        if self.mirror && own <= others_sum * db_to_lin(MIRROR_MARGIN_DB) { 0.0 } else { own }
+        let rest: f32 = others.iter().filter(|o| !o.mirror).map(|o| o.output).sum();
+        if self.mirror && own <= rest * db_to_lin(MIRROR_MARGIN_DB) { 0.0 } else { own }
     }
 }
 
@@ -265,54 +297,107 @@ mod tests {
         if i.is_multiple_of(5) { db_to_lin(-10.0) } else { 0.0 }
     }
 
-    #[test]
-    fn mirror_of_device_output_is_recognized_and_filtered() {
-        let mut f = MirrorFilter::default();
-        for i in 0..200 {
-            f.update(game(i).max(voice(i)), game(i), game(i));
+    fn source(output: f32) -> OtherSession {
+        OtherSession { output, mirror: false, source: true }
+    }
+
+    /// Runs filters for sessions on one device; `raw(i)` gives every session's peak at tick `i`.
+    fn simulate(sessions: usize, ticks: u32, raw: impl Fn(u32) -> Vec<f32>) -> Vec<MirrorFilter> {
+        let mut f = vec![MirrorFilter::default(); sessions];
+        for i in 0..ticks {
+            let raw = raw(i);
+            let snapshot: Vec<OtherSession> = f
+                .iter()
+                .zip(&raw)
+                .map(|(f, &output)| OtherSession { output, mirror: f.is_mirror(), source: f.is_source() })
+                .collect();
+            for (n, filter) in f.iter_mut().enumerate() {
+                let others: Vec<OtherSession> =
+                    snapshot.iter().enumerate().filter(|&(m, _)| m != n).map(|(_, o)| *o).collect();
+                filter.update(raw[n], &others, true);
+            }
         }
-        assert!(f.is_mirror());
-        assert_eq!(f.update(game(3), game(3), game(3)), 0.0, "copied game sound is dropped");
-        let speech = db_to_lin(-10.0);
-        assert_eq!(f.update(speech, game(3), game(3)), speech, "own sound still counts");
-        assert_eq!(f.update(speech, 0.0, 0.0), speech, "own sound counts when nothing else plays");
+        f
+    }
+
+    /// A game, Discord copying the device output with speech of its own, and `copies` pure
+    /// copies (visualizers).
+    fn call(copies: usize, ticks: u32) -> Vec<MirrorFilter> {
+        simulate(copies + 2, ticks, |i| {
+            let mix = game(i).max(voice(i));
+            let mut raw = vec![game(i), mix];
+            raw.extend(std::iter::repeat_n(mix, copies));
+            raw
+        })
     }
 
     #[test]
-    fn source_of_mirrored_sound_is_not_a_mirror() {
-        let mut f = MirrorFilter::default();
-        for i in 0..400 {
-            let copy = game(i).max(voice(i));
-            assert_eq!(f.update(game(i), copy, copy), game(i));
-        }
-        assert!(!f.is_mirror());
-        // Even with no speech at all the source is never louder than its copy.
-        let mut f = MirrorFilter::default();
-        for i in 0..400 {
-            f.update(game(i), game(i), game(i));
-        }
-        assert!(!f.is_mirror());
+    fn mirror_of_device_output_is_recognized_and_filtered() {
+        let f = call(0, 300);
+        assert!(!f[0].is_mirror(), "the game is the source");
+        assert!(f[0].is_source());
+        let mut discord = f[1].clone();
+        assert!(discord.is_mirror());
+        let game_now = [source(game(3))];
+        assert_eq!(discord.update(game(3), &game_now, true), 0.0, "copied game sound is dropped");
+        let speech = db_to_lin(-10.0);
+        assert_eq!(discord.update(speech, &game_now, true), speech, "own sound still counts");
+        assert_eq!(discord.update(speech, &[], true), speech, "own sound counts when nothing else plays");
+    }
+
+    #[test]
+    fn several_mirrors_do_not_hide_each_others_sound() {
+        let f = call(1, 300);
+        assert!(!f[0].is_mirror());
+        assert!(f[1].is_mirror() && f[2].is_mirror());
+        // The visualizer carries the same speech; it must not count against Discord's own sound.
+        let speech = db_to_lin(-10.0);
+        let mut discord = f[1].clone();
+        let others = [source(game(3)), OtherSession { output: speech, mirror: true, source: false }];
+        assert_eq!(discord.update(speech, &others, true), speech);
+        let others = [source(game(3)), OtherSession { output: game(3), mirror: true, source: false }];
+        assert_eq!(discord.update(game(3), &others, true), 0.0);
+    }
+
+    #[test]
+    fn without_own_sound_nothing_is_taken_for_a_mirror() {
+        // Nothing proves who copies whom, so every meter is used as it is.
+        let f = simulate(3, 400, |i| vec![game(i); 3]);
+        assert!(f.iter().all(|f| !f.is_mirror()));
+    }
+
+    #[test]
+    fn loudest_source_next_to_a_mirror_is_not_a_mirror() {
+        // Music louder than the game the whole time; Discord copies both and speaks now and then.
+        let music = db_to_lin(-20.0);
+        let f = simulate(3, 1000, |i| vec![music, game(i), music.max(voice(i))]);
+        assert!(!f[0].is_mirror(), "music");
+        assert!(!f[1].is_mirror(), "game");
+        assert!(f[2].is_mirror(), "discord");
     }
 
     #[test]
     fn independent_app_is_not_a_mirror() {
+        let f = simulate(2, 400, |i| vec![game(i), voice(i)]);
+        assert!(f.iter().all(|f| !f.is_mirror()));
+    }
+
+    #[test]
+    fn targets_are_never_mirrors() {
         let mut f = MirrorFilter::default();
         for i in 0..400 {
-            let v = voice(i);
-            assert_eq!(f.update(v, game(i), game(i)), v);
+            let mix = game(i).max(voice(i));
+            assert_eq!(f.update(mix, &[source(game(i))], false), mix);
         }
         assert!(!f.is_mirror());
     }
 
     #[test]
     fn mirror_ends_when_the_app_stops_copying() {
-        let mut f = MirrorFilter::default();
-        for i in 0..200 {
-            f.update(game(i).max(voice(i)), game(i), game(i));
-        }
+        let mut f = call(0, 300).remove(1);
         assert!(f.is_mirror());
         for i in 0..100 {
-            f.update(voice(i), game(i), game(i));
+            f.update(voice(i), &[source(game(i))], true);
         }
         assert!(!f.is_mirror());
     }
