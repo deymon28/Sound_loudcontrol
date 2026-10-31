@@ -1,6 +1,8 @@
 ﻿//! Pure ducking logic: trigger detection, hold, attack/release envelope and gain curves.
 //! Kept free of any OS calls so it can be unit-tested.
 
+use std::collections::VecDeque;
+
 use crate::config::{DuckMode, FadeCurve, Rule};
 
 pub const FLOOR_DB: f32 = -96.0;
@@ -118,14 +120,101 @@ const MIRROR_MAX_SCORE: u32 = 200;
 const MIRROR_BELOW_PENALTY: u32 = 8;
 /// A session stays a known source for this many updates after it was last below another one.
 const SOURCE_TTL: u32 = 500;
+/// A copy of a session's sound and the session's own meter can be an engine period or two apart,
+/// either way.
+const COPY_PEAK_SKEW_MS: f64 = 40.0;
+/// After a session's volume changes (ducking), copies of its sound keep the old volume for about
+/// 0.1 s.
+const COPY_VOLUME_LAG_MS: f64 = 300.0;
 
 /// What a `MirrorFilter` needs to know about another session on the same device.
 #[derive(Debug, Clone, Copy)]
 pub struct OtherSession {
     /// Peak × session volume: what the session adds to the device output.
     pub output: f32,
+    /// The loudest a copy of the session's sound can read now (see `OutputHistory`).
+    pub ceiling: f32,
+    /// The quietest a copy of the session's sound can read now.
+    pub floor: f32,
     pub mirror: bool,
     pub source: bool,
+}
+
+/// A session's own peak meter, as its `MirrorFilter` weighs it.
+#[derive(Debug, Clone, Copy)]
+pub struct OwnPeak {
+    pub now: f32,
+    /// The lowest and highest readings of the last `COPY_PEAK_SKEW_MS`.
+    pub low: f32,
+    pub high: f32,
+}
+
+impl OwnPeak {
+    #[cfg(test)]
+    pub fn steady(peak: f32) -> Self {
+        Self { now: peak, low: peak, high: peak }
+    }
+}
+
+/// Recent readings of one session. Meters of copies of its sound in other sessions are not read
+/// at the same moment as its own: a copy can show a sound that has just stopped or not yet
+/// started, and it follows a volume change about 0.1 s late, so right after a duck it reads up to
+/// the duck depth louder than the session's output. Comparing single readings would take those
+/// differences for the copying app's own sound.
+#[derive(Debug, Clone, Default)]
+pub struct OutputHistory {
+    /// (time in ms, peak, volume), oldest first.
+    readings: VecDeque<(f64, f32, f32)>,
+}
+
+impl OutputHistory {
+    pub fn push(&mut self, now_ms: f64, peak: f32, volume: f32) {
+        self.readings.push_back((now_ms, peak, volume));
+        // The previous reading always stays, so slow polling still covers the skew.
+        while self.readings.len() > 2 && now_ms - self.readings[0].0 > COPY_VOLUME_LAG_MS {
+            self.readings.pop_front();
+        }
+    }
+
+    /// Readings within `COPY_PEAK_SKEW_MS` of the latest one, and always the previous reading.
+    fn skew_window(&self) -> impl Iterator<Item = &(f64, f32, f32)> {
+        let now = self.readings.back().map_or(0.0, |r| r.0);
+        let previous = self.readings.len().saturating_sub(2);
+        self.readings
+            .iter()
+            .enumerate()
+            .filter(move |&(i, r)| i >= previous || now - r.0 <= COPY_PEAK_SKEW_MS)
+            .map(|(_, r)| r)
+    }
+
+    /// The session as the filters of other sessions see it.
+    pub fn session(&self, mirror: bool, source: bool) -> OtherSession {
+        let Some(&(_, peak, volume)) = self.readings.back() else {
+            return OtherSession { output: 0.0, ceiling: 0.0, floor: 0.0, mirror, source };
+        };
+        let (mut peak_max, mut peak_min) = (peak, peak);
+        for &(_, p, _) in self.skew_window() {
+            peak_max = peak_max.max(p);
+            peak_min = peak_min.min(p);
+        }
+        let (mut volume_max, mut volume_min) = (volume, volume);
+        for &(_, _, v) in &self.readings {
+            volume_max = volume_max.max(v);
+            volume_min = volume_min.min(v);
+        }
+        OtherSession { output: peak * volume, ceiling: peak_max * volume_max, floor: peak_min * volume_min, mirror, source }
+    }
+
+    /// The session's own peak for its own filter.
+    pub fn own(&self) -> OwnPeak {
+        let now = self.readings.back().map_or(0.0, |r| r.1);
+        let (mut low, mut high) = (now, now);
+        for &(_, p, _) in self.skew_window() {
+            low = low.min(p);
+            high = high.max(p);
+        }
+        OwnPeak { now, low, high }
+    }
 }
 
 /// Some apps keep a copy of the device output inside their own audio session. Discord records
@@ -139,7 +228,10 @@ pub struct OtherSession {
 /// carry the same sound, including the app's own.
 ///
 /// Once a session is recognized as a mirror, only sound clearly louder than the other apps on
-/// its device that are not mirrors counts.
+/// its device that are not mirrors counts. Comparisons with other sessions allow for the skew
+/// between a copy and what it copies (`OutputHistory`): a session is quieter than another only
+/// when it stays quieter, and a mirror's own sound counts only when it lasts and stays above
+/// everything the other apps played around it.
 #[derive(Debug, Clone, Default)]
 pub struct MirrorFilter {
     score: u32,
@@ -162,12 +254,12 @@ impl MirrorFilter {
     /// the previous update. `may_mirror` is false for sessions that must always count as sources
     /// (ducking targets: taking one for a mirror would let its own sound keep itself ducked).
     /// Returns the peak that belongs to the app itself.
-    pub fn update(&mut self, own: f32, others: &[OtherSession], may_mirror: bool) -> f32 {
-        let all_max = others.iter().map(|o| o.output).fold(0.0, f32::max);
+    pub fn update(&mut self, own: OwnPeak, others: &[OtherSession], may_mirror: bool) -> f32 {
+        let all_floor = others.iter().map(|o| o.floor).fold(0.0, f32::max);
         let source_max = others.iter().filter(|o| o.source).map(|o| o.output).fold(0.0, f32::max);
-        let own_db = lin_to_db(own);
+        let own_db = lin_to_db(own.now);
         self.source_left = self.source_left.saturating_sub(1);
-        if all_max >= MIRROR_AUDIBLE && own_db <= lin_to_db(all_max) - MIRROR_BELOW_DB {
+        if all_floor >= MIRROR_AUDIBLE && lin_to_db(own.high) <= lin_to_db(all_floor) - MIRROR_BELOW_DB {
             self.source_left = SOURCE_TTL;
             self.score = self.score.saturating_sub(MIRROR_BELOW_PENALTY);
             if self.score == 0 {
@@ -191,8 +283,8 @@ impl MirrorFilter {
         } else if self.score == 0 {
             self.mirror = false;
         }
-        let rest: f32 = others.iter().filter(|o| !o.mirror).map(|o| o.output).sum();
-        if self.mirror && own <= rest * db_to_lin(MIRROR_MARGIN_DB) { 0.0 } else { own }
+        let rest: f32 = others.iter().filter(|o| !o.mirror).map(|o| o.ceiling).sum();
+        if self.mirror && own.low <= rest * db_to_lin(MIRROR_MARGIN_DB) { 0.0 } else { own.now }
     }
 }
 
@@ -297,27 +389,51 @@ mod tests {
         if i.is_multiple_of(5) { db_to_lin(-10.0) } else { 0.0 }
     }
 
-    fn source(output: f32) -> OtherSession {
-        OtherSession { output, mirror: false, source: true }
+    /// A session whose output has not changed lately.
+    fn steady(output: f32, mirror: bool, source: bool) -> OtherSession {
+        OtherSession { output, ceiling: output, floor: output, mirror, source }
     }
 
-    /// Runs filters for sessions on one device; `raw(i)` gives every session's peak at tick `i`.
-    fn simulate(sessions: usize, ticks: u32, raw: impl Fn(u32) -> Vec<f32>) -> Vec<MirrorFilter> {
+    fn source(output: f32) -> OtherSession {
+        steady(output, false, true)
+    }
+
+    /// Runs filters for sessions on one device, read every 10 ms like the engine does.
+    /// `raw(i)` gives every session's (peak, volume) at tick `i`; `on_tick` sees the filters and
+    /// what they returned.
+    fn simulate_with(
+        sessions: usize,
+        ticks: u32,
+        raw: impl Fn(u32) -> Vec<(f32, f32)>,
+        mut on_tick: impl FnMut(u32, &[MirrorFilter], &[f32]),
+    ) -> Vec<MirrorFilter> {
         let mut f = vec![MirrorFilter::default(); sessions];
+        let mut h = vec![OutputHistory::default(); sessions];
+        let mut own = vec![0.0; sessions];
         for i in 0..ticks {
             let raw = raw(i);
             let snapshot: Vec<OtherSession> = f
                 .iter()
+                .zip(&mut h)
                 .zip(&raw)
-                .map(|(f, &output)| OtherSession { output, mirror: f.is_mirror(), source: f.is_source() })
+                .map(|((f, h), &(peak, volume))| {
+                    h.push(f64::from(i) * 10.0, peak, volume);
+                    h.session(f.is_mirror(), f.is_source())
+                })
                 .collect();
             for (n, filter) in f.iter_mut().enumerate() {
                 let others: Vec<OtherSession> =
                     snapshot.iter().enumerate().filter(|&(m, _)| m != n).map(|(_, o)| *o).collect();
-                filter.update(raw[n], &others, true);
+                own[n] = filter.update(h[n].own(), &others, true);
             }
+            on_tick(i, &f, &own);
         }
         f
+    }
+
+    /// Like `simulate_with` for sessions at full volume; `raw(i)` gives every session's peak.
+    fn simulate(sessions: usize, ticks: u32, raw: impl Fn(u32) -> Vec<f32>) -> Vec<MirrorFilter> {
+        simulate_with(sessions, ticks, |i| raw(i).into_iter().map(|p| (p, 1.0)).collect(), |_, _, _| {})
     }
 
     /// A game, Discord copying the device output with speech of its own, and `copies` pure
@@ -339,10 +455,10 @@ mod tests {
         let mut discord = f[1].clone();
         assert!(discord.is_mirror());
         let game_now = [source(game(3))];
-        assert_eq!(discord.update(game(3), &game_now, true), 0.0, "copied game sound is dropped");
+        assert_eq!(discord.update(OwnPeak::steady(game(3)), &game_now, true), 0.0, "copied game sound is dropped");
         let speech = db_to_lin(-10.0);
-        assert_eq!(discord.update(speech, &game_now, true), speech, "own sound still counts");
-        assert_eq!(discord.update(speech, &[], true), speech, "own sound counts when nothing else plays");
+        assert_eq!(discord.update(OwnPeak::steady(speech), &game_now, true), speech, "own sound still counts");
+        assert_eq!(discord.update(OwnPeak::steady(speech), &[], true), speech, "own sound counts when nothing else plays");
     }
 
     #[test]
@@ -353,10 +469,76 @@ mod tests {
         // The visualizer carries the same speech; it must not count against Discord's own sound.
         let speech = db_to_lin(-10.0);
         let mut discord = f[1].clone();
-        let others = [source(game(3)), OtherSession { output: speech, mirror: true, source: false }];
-        assert_eq!(discord.update(speech, &others, true), speech);
-        let others = [source(game(3)), OtherSession { output: game(3), mirror: true, source: false }];
-        assert_eq!(discord.update(game(3), &others, true), 0.0);
+        let others = [source(game(3)), steady(speech, true, false)];
+        assert_eq!(discord.update(OwnPeak::steady(speech), &others, true), speech);
+        let others = [source(game(3)), steady(game(3), true, false)];
+        assert_eq!(discord.update(OwnPeak::steady(game(3)), &others, true), 0.0);
+    }
+
+    #[test]
+    fn output_history_covers_the_lag_of_copies() {
+        let mut h = OutputHistory::default();
+        h.push(0.0, db_to_lin(-20.0), 1.0);
+        h.push(10.0, db_to_lin(-60.0), 0.1);
+        let s = h.session(false, false);
+        assert!((lin_to_db(s.output) - -80.0).abs() < 0.01);
+        assert!((lin_to_db(s.ceiling) - -20.0).abs() < 0.01, "a copy may still carry the last peak at full volume");
+        assert!((lin_to_db(s.floor) - -80.0).abs() < 0.01);
+
+        // Peaks count for 40 ms, volumes for 300 ms.
+        h.push(100.0, db_to_lin(-60.0), 0.1);
+        h.push(110.0, db_to_lin(-60.0), 0.1);
+        let s = h.session(false, false);
+        assert!((lin_to_db(s.ceiling) - -60.0).abs() < 0.01, "got {}", lin_to_db(s.ceiling));
+        h.push(400.0, db_to_lin(-60.0), 0.1);
+        let s = h.session(false, false);
+        assert!((lin_to_db(s.ceiling) - -80.0).abs() < 0.01, "got {}", lin_to_db(s.ceiling));
+
+        // With slow polling the previous reading still counts.
+        h.push(2000.0, db_to_lin(-30.0), 1.0);
+        let s = h.session(false, false);
+        assert!((lin_to_db(s.ceiling) - -30.0).abs() < 0.01);
+        assert!((lin_to_db(s.floor) - -80.0).abs() < 0.01);
+        let own = h.own();
+        assert!((lin_to_db(own.now) - -30.0).abs() < 0.01);
+        assert!((lin_to_db(own.low) - -60.0).abs() < 0.01, "own peaks ignore the volume");
+        assert!((lin_to_db(own.high) - -30.0).abs() < 0.01);
+    }
+
+    /// Notes that decay slowly and then stop at once, read every 10 ms.
+    fn music(i: u32) -> f32 {
+        let t = i % 40;
+        if t < 30 { db_to_lin(-20.0 - 0.3 * t as f32) } else { db_to_lin(-70.0) }
+    }
+
+    #[test]
+    fn skewed_copy_is_not_taken_for_own_sound() {
+        // Music being ducked and released, and an app whose meter copies it one reading late or
+        // early and follows its volume 100 ms late. The app speaks now and then during the first
+        // 6 s.
+        for ahead in [false, true] {
+            let volume = |i: u32| if i < 600 || (i / 150).is_multiple_of(2) { 1.0 } else { 0.1 };
+            let speech = |i: u32| if i < 600 && i % 50 < 10 { db_to_lin(-10.0) } else { 0.0 };
+            let raw = |i: u32| {
+                let copied = if ahead { i + 1 } else { i.saturating_sub(1) };
+                let copy = music(copied) * volume(i.saturating_sub(10));
+                vec![(music(i), volume(i)), (copy.max(speech(i)), 1.0)]
+            };
+            let mut leaked = Vec::new();
+            let f = simulate_with(2, 3000, raw, |i, f, own| {
+                if i >= 600 {
+                    assert!(f[1].is_mirror() && !f[1].is_source(), "ahead {ahead}, tick {i}: the copy stays a mirror");
+                    if own[1] > 0.0 {
+                        leaked.push(i);
+                    }
+                }
+                assert!(!f[0].is_mirror(), "ahead {ahead}, tick {i}: the music is the source");
+            });
+            assert!(leaked.is_empty(), "ahead {ahead}: copied music counted as own sound at ticks {leaked:?}");
+            let mut app = f[1].clone();
+            let speech = db_to_lin(-10.0);
+            assert_eq!(app.update(OwnPeak::steady(speech), &[source(music(3))], true), speech, "own sound still counts");
+        }
     }
 
     #[test]
@@ -387,7 +569,7 @@ mod tests {
         let mut f = MirrorFilter::default();
         for i in 0..400 {
             let mix = game(i).max(voice(i));
-            assert_eq!(f.update(mix, &[source(game(i))], false), mix);
+            assert_eq!(f.update(OwnPeak::steady(mix), &[source(game(i))], false), mix);
         }
         assert!(!f.is_mirror());
     }
@@ -397,7 +579,7 @@ mod tests {
         let mut f = call(0, 300).remove(1);
         assert!(f.is_mirror());
         for i in 0..100 {
-            f.update(voice(i), &[source(game(i))], true);
+            f.update(OwnPeak::steady(voice(i)), &[source(game(i))], true);
         }
         assert!(!f.is_mirror());
     }

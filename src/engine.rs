@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::{AudioSystem, Session};
 use crate::config::{self, AppMatcher, Config, Rule, normalize_exe};
-use crate::dsp::{self, MirrorFilter, OtherSession, RuleState};
+use crate::dsp::{self, MirrorFilter, OtherSession, OutputHistory, OwnPeak, RuleState};
 use crate::timer::Ticker;
 
 /// Poll interval when no trigger application is running.
@@ -243,6 +243,10 @@ struct Engine {
     meters: HashMap<String, f32>,
     /// Per session: whether its meter also carries other apps' sound.
     mirrors: HashMap<String, MirrorFilter>,
+    /// Per session: recent readings, which copies of its sound in other sessions trail.
+    histories: HashMap<String, OutputHistory>,
+    /// Milliseconds of engine time, for `histories`.
+    clock_ms: f64,
     rule_meters: HashMap<u64, f32>,
     last_telemetry: Instant,
     was_ducking: bool,
@@ -358,6 +362,8 @@ impl Engine {
             restore_dirty: true,
             meters: HashMap::new(),
             mirrors: HashMap::new(),
+            histories: HashMap::new(),
+            clock_ms: 0.0,
             rule_meters: HashMap::new(),
             last_telemetry: Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now),
             was_ducking: false,
@@ -390,6 +396,7 @@ impl Engine {
             for id in &refreshed.removed {
                 self.meters.remove(id);
                 self.mirrors.remove(id);
+                self.histories.remove(id);
                 if let Some(m) = self.managed.remove(id) {
                     // The app closed (or lost its device) while ducked. Windows remembers the
                     // lowered volume for the app's next start, so the user's volume is handed
@@ -421,6 +428,7 @@ impl Engine {
     /// One evaluation pass. Returns whether fast polling is needed.
     fn tick(&mut self, dt_ms: f32) -> bool {
         let paused = self.cfg.settings.paused;
+        self.clock_ms += f64::from(dt_ms);
         let ui_visible = self.shared.ui_visible();
         let publish = self.last_telemetry.elapsed() >= Duration::from_millis(if ui_visible { 30 } else { 250 });
 
@@ -435,17 +443,21 @@ impl Engine {
             .filter(|s| self.cfg.rules.iter().zip(&self.compiled).any(|(r, c)| r.enabled && c.is_trigger(s)))
             .map(|s| s.device_id.as_str())
             .collect();
-        let mut raw: HashMap<&str, (f32, OtherSession)> = HashMap::with_capacity(self.audio.sessions.len());
+        let mut raw: HashMap<&str, (OwnPeak, OtherSession)> = HashMap::with_capacity(self.audio.sessions.len());
         for (key, s) in &self.audio.sessions {
             if read_all || trigger_devices.contains(&s.device_id.as_str()) {
                 let peak = s.peak();
+                if !self.histories.contains_key(key) {
+                    self.histories.insert(key.clone(), OutputHistory::default());
+                }
+                let history = self.histories.get_mut(key).expect("inserted above");
+                history.push(self.clock_ms, peak, s.volume().unwrap_or(1.0));
                 let filter = self.mirrors.get(key);
-                let other = OtherSession {
-                    output: peak * s.volume().unwrap_or(1.0),
-                    mirror: filter.is_some_and(MirrorFilter::is_mirror),
-                    source: filter.is_some_and(MirrorFilter::is_source),
-                };
-                raw.insert(key.as_str(), (peak, other));
+                let other = history.session(
+                    filter.is_some_and(MirrorFilter::is_mirror),
+                    filter.is_some_and(MirrorFilter::is_source),
+                );
+                raw.insert(key.as_str(), (history.own(), other));
             }
         }
         let mut peaks: HashMap<&str, f32> = HashMap::with_capacity(raw.len());

@@ -83,6 +83,13 @@ app's own. It takes a few moments of the app's own sound over other audio (someo
 while the game plays) to recognize this, so a mirrored game can still trigger a duck right after
 the app starts. Ducking targets are never treated as mirrors.
 
+A recording is not read at the same moment as the app it copies. It can run an audio engine
+period (about 10 ms) ahead of that app's meter or behind it, and it follows a volume change about
+0.1 s late, so right after a duck it still carries the target at its old volume. LoudControl
+therefore compares a mirroring app with the loudest the other apps played in the last 40 ms, at
+the highest volume they had in the last 0.3 s. The app's own sound counts only when it stays above
+that for 40 ms.
+
 ## Configuration
 
 Settings are stored in `%APPDATA%\LoudControl\config.toml`. Changes made in the UI are saved
